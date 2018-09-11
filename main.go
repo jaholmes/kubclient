@@ -1,94 +1,47 @@
 package main
 
 import (
-	"crypto/tls"
-	"errors"
-	"github.com/jaholmes/kubclient/appdconfig"
-	"github.com/jaholmes/kubclient/config"
-	"github.com/jaholmes/kubclient/nozzle"
-	"github.com/jaholmes/kubclient/sinks"
-	"github.com/jaholmes/kubclient/uaa"
-	"github.com/jaholmes/kubclient/writernozzle"
-	"log"
-	"os"
-	"strings"
+	"fmt"
 	"time"
 
-	"github.com/cloudfoundry/noaa/consumer"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 func main() {
-	logger := log.New(os.Stdout, "[APPD_NOZZLE] ", log.Lshortfile)
-
-	conf, err := config.Parse()
+	// creates the in-cluster config
+	config, err := rest.InClusterConfig()
 	if err != nil {
-		logger.Fatal("Unable to build Nozzle config from environment", err)
+		panic(err.Error())
 	}
-
-	appdConf, err := appdconfig.Parse()
+	// creates the clientset
+	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		logger.Fatal("Unable to build Appdynamics config from environment", err)
+		panic(err.Error())
 	}
-	logger.Printf("Using Appdynamics Configuration %v", appdConf)
-
-	var token, trafficControllerURL string
-
-	if conf.UAAURL != "" {
-		logger.Printf("Fetching auth token via UAA: %v\n", conf.UAAURL)
-
-		trafficControllerURL = conf.TrafficControllerURL
-		if trafficControllerURL == "" {
-			logger.Fatal(errors.New("NOZZLE_TRAFFIC_CONTROLLER_URL is required when authenticating via UAA"))
-		}
-
-		fetcher := uaa.NewUAATokenFetcher(conf.UAAURL, conf.Username, conf.Password, conf.SkipSSL)
-		token, err = fetcher.FetchAuthToken()
+	for {
+		pods, err := clientset.CoreV1().Pods("").List(metav1.ListOptions{})
 		if err != nil {
-			logger.Fatal("Unable to fetch token via UAA", err)
+			panic(err.Error())
 		}
-	} else {
-		logger.Fatal(errors.New("NOZZLE_UAA_URL is required"))
-	}
+		fmt.Printf("There are %d pods in the cluster\n", len(pods.Items))
 
-	logger.Printf("Consuming firehose: %v\n", trafficControllerURL)
-
-	noaaConsumer := consumer.New(trafficControllerURL, &tls.Config{InsecureSkipVerify: conf.SkipSSL}, nil)
-	eventsChan, errsChan := noaaConsumer.Firehose(conf.FirehoseSubscriptionID, token)
-
-	var eventSerializer nozzle.EventSerializer
-	var sinkWriter nozzle.Client
-
-	switch strings.ToLower(appdConf.Sink) {
-	case sinks.Stdout:
-		eventSerializer = writernozzle.NewWriterEventSerializer()
-		sinkWriter = writernozzle.NewWriterClient(os.Stdout)
-	case sinks.Controller:
-		sinkWriter = sinks.NewControllerClient(appdConf.ControllerHost,
-			appdConf.AccessKey,
-			appdConf.Account,
-			appdConf.NozzleAppName,
-			appdConf.NozzleTierName,
-			appdConf.NozzleNodeName,
-			appdConf.ControllerPort,
-			appdConf.SslEnabled,
-			logger)
-		idForMetricPath := appdConf.NozzleTierName
-		if appdConf.NozzleTierId != "" {
-			idForMetricPath = appdConf.NozzleTierId //For Controllers with versions <= v4.4.[TODO - Find the exact version for fix DASH-2668]
+		// Examples for error handling:
+		// - Use helper functions like e.g. errors.IsNotFound()
+		// - And/or cast to StatusError and use its properties like e.g. ErrStatus.Message
+		_, err = clientset.CoreV1().Pods("default").Get("example-xxxxx", metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			fmt.Printf("Pod not found\n")
+		} else if statusError, isStatus := err.(*errors.StatusError); isStatus {
+			fmt.Printf("Error getting pod %v\n", statusError.ErrStatus.Message)
+		} else if err != nil {
+			panic(err.Error())
+		} else {
+			fmt.Printf("Found pod\n")
 		}
-		eventSerializer = sinks.NewControllerEventSerializer(idForMetricPath)
-	default:
-		logger.Fatal(errors.New("set APPD_SINK environment variable to one of the following stdout|controller"))
-	}
 
-	logger.Printf("Forwarding events to %s: %s", appdConf.Sink, conf.SelectedEvents)
-
-	flush_time := appdConf.SamplingRate
-	forwarder := nozzle.NewForwarder(sinkWriter, eventSerializer,
-		conf.SelectedEvents, eventsChan, errsChan, logger)
-
-	err = forwarder.Run(time.Duration(flush_time) * time.Second)
-	if err != nil {
-		logger.Fatal("Error forwarding", err)
+		time.Sleep(10 * time.Second)
 	}
 }
